@@ -35,7 +35,9 @@ pip install -r requirements.txt
 python -m app.app
 ```
 
-Then open `http://localhost:5000/` and `http://localhost:5000/health`.
+The app binds to `127.0.0.1` by default (loopback only). Then open `http://localhost:5000/` and `http://localhost:5000/health`.
+
+The Docker image sets `FLASK_RUN_HOST=0.0.0.0` so the process is reachable through published container ports. Do not use that host on a raw host network unless you intend to expose the service.
 
 ## Run tests
 
