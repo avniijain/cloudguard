@@ -50,7 +50,7 @@ jobs:
         run: docker build -t cloudguard-app:${{ github.sha }} .
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -61,7 +61,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Trivy filesystem SARIF
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -72,7 +72,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: cloudguard-app:${{ github.sha }}
           scanners: vuln,secret,misconfig
@@ -82,7 +82,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Trivy image SARIF
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: cloudguard-app:${{ github.sha }}
           scanners: vuln,secret,misconfig
