@@ -13,3 +13,10 @@ env
 .github
 .idea
 .vscode
+.scannerwork
+.sonar
+coverage.xml
+*.sarif
+trivy-reports
+sonar-project.properties
+pytest.ini

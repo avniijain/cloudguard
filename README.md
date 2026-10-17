@@ -1,13 +1,15 @@
 # CloudGuard Sample Application
 
-This repository contains a minimal Python Flask application used to validate the **CloudGuard** DevSecOps CI/CD pipeline. It provides a small HTTP service with health checks, unit tests, Docker packaging, and a basic GitHub Actions workflow—without SonarQube, Trivy, the Risk Gate, or deployment (those come in later phases).
+This repository contains a minimal Python Flask application used to validate the **CloudGuard** DevSecOps CI/CD pipeline.
+
+**Current phase:** build, test, SonarQube code quality, Docker image build, and Trivy scans. The CloudGuard Risk Gate, dashboard, Helm, and Kubernetes deploy are not implemented yet. Scan findings are collected as reports and do **not** block the pipeline.
 
 ## Endpoints
 
-| Method | Path     | Description                          |
-|--------|----------|--------------------------------------|
-| GET    | `/`      | JSON welcome payload                 |
-| GET    | `/health`| `{"status": "healthy"}`              |
+| Method | Path      | Description             |
+|--------|-----------|-------------------------|
+| GET    | `/`       | JSON welcome payload    |
+| GET    | `/health` | `{"status": "healthy"}` |
 
 ## Run locally
 
@@ -22,22 +24,13 @@ python -m venv .venv
 ```powershell
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-$env:FLASK_APP = "app.app:app"
-python -m flask run --host 0.0.0.0 --port 5000
+python -m app.app
 ```
 
 **Linux / macOS:**
 
 ```bash
 source .venv/bin/activate
-pip install -r requirements.txt
-export FLASK_APP=app.app:app
-flask run --host 0.0.0.0 --port 5000
-```
-
-Alternatively, run the module directly:
-
-```bash
 pip install -r requirements.txt
 python -m app.app
 ```
@@ -46,52 +39,93 @@ Then open `http://localhost:5000/` and `http://localhost:5000/health`.
 
 ## Run tests
 
-With dependencies installed and the virtual environment active:
-
 ```bash
-pytest
-```
-
-Run with verbose output:
-
-```bash
-pytest -v
+pytest -v --cov=app --cov-report=term
 ```
 
 ## Docker
 
-Build the image:
-
 ```bash
 docker build -t cloudguard-app .
-```
-
-Run the container:
-
-```bash
 docker run --rm -p 5000:5000 cloudguard-app
 ```
 
-Verify:
+## CI pipeline (Phase 2)
+
+On every push and pull request, GitHub Actions (`.github/workflows/ci.yml`) runs:
+
+1. Python 3.11 setup and dependency install
+2. `pytest` with coverage (`coverage.xml` for SonarQube)
+3. SonarQube / SonarCloud analysis (skipped until secrets are set)
+4. Docker image build
+5. Trivy filesystem scan (`vuln`, `secret`, `misconfig`)
+6. Trivy container image scan
+7. Upload JSON/SARIF reports as workflow artifacts
+8. Upload SARIF to the GitHub Security tab when GitHub Advanced Security is available
+
+Trivy `exit-code` is `0` on purpose: findings are recorded, not used as a merge gate. That comes later with the CloudGuard Risk Gate.
+
+## Manual setup required
+
+GitHub Actions cannot create a SonarQube/SonarCloud project or tokens for you. Complete these once per repository.
+
+### 1. SonarQube or SonarCloud (required for the quality step)
+
+Pick **one**:
+
+**Option A — SonarCloud (typical with GitHub)**
+
+1. Create an account at [sonarcloud.io](https://sonarcloud.io) and import this GitHub repository (or create a project manually).
+2. Copy the **organization key** (for example `my-org`).
+3. Generate a token: **My Account → Security → Generate Token**.
+4. In GitHub: **Settings → Secrets and variables → Actions**:
+   - Secret `SONAR_TOKEN` = the token
+   - Secret `SONAR_HOST_URL` = `https://sonarcloud.io`
+   - Variable `SONAR_ORGANIZATION` = your SonarCloud organization key
+5. Either set `SONAR_ORGANIZATION` as above, or uncomment `sonar.organization` in `sonar-project.properties`.
+
+**Option B — self-hosted SonarQube**
+
+1. Run a SonarQube server that GitHub-hosted runners can reach (public URL or self-hosted runner on the same network).
+2. Create a project with key `cloudguard` (must match `sonar.projectKey` in `sonar-project.properties`).
+3. Generate a project or user token.
+4. In GitHub:
+   - Secret `SONAR_TOKEN` = the token
+   - Secret `SONAR_HOST_URL` = your server URL, for example `https://sonarqube.example.com`
+5. Do **not** set `SONAR_ORGANIZATION` unless your server requires it.
+
+Until `SONAR_TOKEN` exists, CI still runs tests and Trivy, and skips SonarQube with a log message.
+
+### 2. GitHub Security / SARIF (optional)
+
+Uploading Trivy SARIF to **Security → Code scanning** needs GitHub Advanced Security (or code scanning on public repositories). On private repos without GHAS, the upload step is allowed to fail (`continue-on-error`); JSON reports are still available as **Actions artifacts**.
+
+### 3. Trivy
+
+No account or token is required. The first run downloads Trivy vulnerability databases (handled by the action).
+
+### 4. Local Trivy (optional)
+
+Install [Trivy](https://github.com/aquasecurity/trivy), then:
 
 ```bash
-curl http://localhost:5000/health
+trivy fs --scanners vuln,secret,misconfig .
+docker build -t cloudguard-app:local .
+trivy image cloudguard-app:local
 ```
-
-## CI
-
-On every push and pull request, GitHub Actions (`.github/workflows/ci.yml`) installs Python 3.11, installs dependencies, and runs `pytest`.
 
 ## Project layout
 
 ```
 .
 ├── app/
-│   ├── app.py          # Flask application
-│   └── test_app.py     # pytest tests
+│   ├── app.py                 # Flask application
+│   └── test_app.py            # pytest tests
 ├── .github/workflows/
-│   └── ci.yml          # Basic CI (test only)
+│   └── ci.yml                 # Build, test, SonarQube, Trivy
 ├── Dockerfile
+├── sonar-project.properties
+├── pytest.ini
 ├── requirements.txt
 └── README.md
 ```

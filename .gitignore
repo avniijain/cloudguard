@@ -9,10 +9,15 @@ venv/
 env/
 ENV/
 
-# Testing
+# Testing / quality
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
+.scannerwork/
+.sonar/
+*.sarif
+trivy-reports/
 
 # Environment
 .env
