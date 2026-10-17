@@ -5,7 +5,7 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --only-binary=:all: -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY app/ ./app/
 RUN chown -R appuser:appuser /app
