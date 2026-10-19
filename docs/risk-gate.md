@@ -72,6 +72,17 @@ With local Trivy JSON files:
 python risk_gate.py --fs-report trivy-fs.json --image-report trivy-image.json --mode report-only
 ```
 
+CLI report, Sonar status/task, enrichment fixture, and output paths are confined
+to the current working directory after canonical resolution. Traversal,
+absolute paths outside that workspace, Windows drive paths on non-Windows
+systems, and symlinks resolving outside the workspace are rejected; file access
+uses no-follow opens and validates regular files. Run local commands from the
+project root, as CI does. A selected policy JSON is workspace-confined by
+default. If an operator intentionally stores policy outside the workspace, use
+the explicit `--allow-external-policy` option; the policy file remains read-only.
+The GitHub-provided `GITHUB_STEP_SUMMARY` path is treated as a trusted runner
+output path and is opened without following symlinks.
+
 Use `--mode enforce` to return exit code 1 for BLOCK. ALLOW and WARN return 0;
 report-only always returns 0 after writing the decision, including for BLOCK.
 Missing required reports still produce a degraded BLOCK decision in either

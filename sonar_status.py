@@ -14,6 +14,7 @@ from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+from safe_paths import read_text, write_text
 
 def _fetch_json(url: str, token: str, timeout: float) -> Any:
     request = Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -23,9 +24,9 @@ def _fetch_json(url: str, token: str, timeout: float) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _read_properties(path: Path) -> dict[str, str]:
+def _read_properties(path: Path, workspace_root: Path) -> dict[str, str]:
     properties: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in read_text(path, workspace_root).splitlines():
         line = raw_line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
@@ -63,6 +64,7 @@ def collect_status(
     timeout_seconds: float = 300.0,
     request_json: Callable[[str, str, float], Any] = _fetch_json,
     sleep: Callable[[float], None] = time.sleep,
+    workspace_root: Path | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "configured": True,
@@ -72,7 +74,7 @@ def collect_status(
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        properties = _read_properties(task_file)
+        properties = _read_properties(task_file, workspace_root or Path.cwd())
         task_url = properties.get("ceTaskUrl")
         if not task_url:
             raise ValueError("scanner task URL is missing")
@@ -130,14 +132,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=Path("sonar-status.json"))
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     args = parser.parse_args(argv)
+    workspace_root = Path.cwd().resolve(strict=True)
     token = os.environ.get("SONAR_TOKEN", "")
     host_url = os.environ.get("SONAR_HOST_URL", "")
     if not token or not host_url:
         print("Sonar status: configured scan credentials are unavailable.", file=sys.stderr)
         return 2
-    status = collect_status(args.task_file, host_url, token, args.timeout_seconds)
+    status = collect_status(
+        args.task_file,
+        host_url,
+        token,
+        args.timeout_seconds,
+        workspace_root=workspace_root,
+    )
     try:
-        args.output.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        write_text(
+            args.output,
+            json.dumps(status, indent=2, sort_keys=True) + "\n",
+            workspace_root,
+        )
     except OSError:
         print("Sonar status: unable to write status report.", file=sys.stderr)
         return 2

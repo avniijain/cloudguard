@@ -17,6 +17,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from safe_paths import PathSecurityError, read_text, write_text
+
 
 POLICY_VERSION = "1.0"
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
@@ -85,9 +87,11 @@ def _normalize_cve(value: Any) -> str | None:
     return None
 
 
-def _read_json(path: Path) -> Any:
+def _read_json(path: Path, workspace_root: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text(path, workspace_root))
+    except PathSecurityError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise FeedError("feed file could not be read or parsed") from exc
 
@@ -110,9 +114,11 @@ class FeedEnricher:
         kev_file: Path | None = None,
         epss_file: Path | None = None,
         fetch_json: Callable[[str], Any] | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
         self.kev_file = kev_file
         self.epss_file = epss_file
+        self.workspace_root = workspace_root or Path.cwd()
         self.fetch_json = fetch_json or _fetch_json
         self.kev_ids: set[str] | None = None
         self.epss_scores: dict[str, float] = {}
@@ -125,7 +131,7 @@ class FeedEnricher:
             return
         self._kev_loaded = True
         try:
-            payload = _read_json(self.kev_file) if self.kev_file else self.fetch_json(KEV_URL)
+            payload = _read_json(self.kev_file, self.workspace_root) if self.kev_file else self.fetch_json(KEV_URL)
             records = payload.get("vulnerabilities") if isinstance(payload, dict) else None
             if not isinstance(records, list):
                 raise FeedError("CISA KEV response has an invalid schema")
@@ -135,7 +141,7 @@ class FeedEnricher:
                     raise FeedError("CISA KEV response contains an invalid record")
                 ids.add(_normalize_cve(record["cveID"]) or "")
             self.kev_ids = ids
-        except FeedError:
+        except (FeedError, OSError):
             self.errors.append("CISA KEV catalog unavailable or invalid")
 
     def _load_epss(self, cves: list[str]) -> None:
@@ -145,14 +151,14 @@ class FeedEnricher:
         self._epss_requested.update(missing)
         try:
             if self.epss_file:
-                payload = _read_json(self.epss_file)
+                payload = _read_json(self.epss_file, self.workspace_root)
                 self._accept_epss_response(payload, set(missing))
                 return
             for offset in range(0, len(missing), EPSS_BATCH_SIZE):
                 batch = missing[offset : offset + EPSS_BATCH_SIZE]
                 url = f"{EPSS_URL}?{urlencode({'cve': ','.join(batch)})}"
                 self._accept_epss_response(self.fetch_json(url), set(batch))
-        except FeedError:
+        except (FeedError, OSError):
             self.errors.append("FIRST EPSS data unavailable or invalid")
 
     def _accept_epss_response(self, payload: Any, requested: set[str]) -> None:
@@ -235,11 +241,20 @@ def _policy_with_overrides(overrides: Any) -> dict[str, Any]:
     return policy
 
 
-def load_policy(path: Path | None) -> dict[str, Any]:
+def load_policy(
+    path: Path | None,
+    workspace_root: Path | None = None,
+    *,
+    allow_external: bool = False,
+) -> dict[str, Any]:
     if path is None:
         return _policy_with_overrides({})
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            read_text(path, workspace_root or Path.cwd(), allow_external=allow_external)
+        )
+    except PathSecurityError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PolicyError("policy file could not be read or parsed") from exc
     return _policy_with_overrides(value)
@@ -250,9 +265,11 @@ def _append_data_issue(issues: list[str], message: str) -> None:
         issues.append(message)
 
 
-def _parse_report(path: Path, source: str, issues: list[str]) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+def _parse_report(
+    path: Path, source: str, issues: list[str], workspace_root: Path
+) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
     try:
-        report = json.loads(path.read_text(encoding="utf-8"))
+        report = json.loads(read_text(path, workspace_root))
     except FileNotFoundError:
         _append_data_issue(issues, f"{source} Trivy report is missing")
         return []
@@ -352,11 +369,11 @@ def _finding_key(kind: str, data: dict[str, Any], context: dict[str, str]) -> tu
 
 
 def _collect_findings(
-    report_paths: list[tuple[Path, str]], issues: list[str]
+    report_paths: list[tuple[Path, str]], issues: list[str], workspace_root: Path
 ) -> dict[str, dict[str, Any]]:
     findings: dict[str, dict[str, Any]] = {}
     for path, source in report_paths:
-        for kind, data, context in _parse_report(path, source, issues):
+        for kind, data, context in _parse_report(path, source, issues, workspace_root):
             if kind == "vulnerability" and any(
                 not _valid_text(data.get(field), 200)
                 for field in ("VulnerabilityID", "PkgName", "InstalledVersion")
@@ -393,12 +410,12 @@ def _collect_findings(
 
 
 def _evaluate_sonar(
-    configured: bool, path: Path, issues: list[str]
+    configured: bool, path: Path, issues: list[str], workspace_root: Path
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     if not configured:
         return {"configured": False, "status": "NOT_CONFIGURED"}, [], []
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(read_text(path, workspace_root))
     except FileNotFoundError:
         _append_data_issue(issues, "Configured SonarQube status report is missing")
         return {"configured": True, "status": "UNKNOWN"}, [], ["SONAR_STATUS_UNAVAILABLE"]
@@ -442,11 +459,13 @@ def decide(
     enricher: FeedEnricher | None = None,
     sonar_status: Path = Path("sonar-status.json"),
     sonar_configured: bool = False,
+    workspace_root: Path | None = None,
 ) -> dict[str, Any]:
+    root = (workspace_root or Path.cwd()).resolve(strict=True)
     active_policy = policy or _policy_with_overrides({})
     data_issues: list[str] = []
     findings = _collect_findings(
-        [(fs_report, "filesystem"), (image_report, "image")], data_issues
+        [(fs_report, "filesystem"), (image_report, "image")], data_issues, root
     )
     cves = sorted(
         {
@@ -516,7 +535,7 @@ def decide(
         rendered_findings.append(finding)
 
     sonar, sonar_rules, sonar_status_rules = _evaluate_sonar(
-        sonar_configured, sonar_status, data_issues
+        sonar_configured, sonar_status, data_issues, root
     )
     security_failure = "SONAR_SECURITY_QUALITY_GATE_FAILURE" in sonar_rules
     non_security_failure = "SONAR_NON_SECURITY_QUALITY_GATE_FAILURE" in sonar_rules
@@ -605,8 +624,13 @@ def _write_summary(report: dict[str, Any]) -> None:
     major_reasons = list(dict.fromkeys(reason.split(":", 1)[0] for reason in reasons))
     lines.extend(f"- `{reason}`" for reason in major_reasons)
     try:
-        with Path(summary_path).open("a", encoding="utf-8") as summary:
-            summary.write("\n".join(lines) + "\n")
+        write_text(
+            summary_path,
+            "\n".join(lines) + "\n",
+            Path.cwd(),
+            append=True,
+            allow_external=True,
+        )
     except OSError:
         print("Risk Gate: unable to write the GitHub Actions summary.", file=sys.stderr)
 
@@ -617,6 +641,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--image-report", type=Path, default=Path("trivy-image.json"))
     parser.add_argument("--output", type=Path, default=Path("risk-decision.json"))
     parser.add_argument("--policy", type=Path)
+    parser.add_argument(
+        "--allow-external-policy",
+        action="store_true",
+        help="Allow the explicitly selected policy JSON to reside outside the working directory.",
+    )
     parser.add_argument("--kev-file", type=Path)
     parser.add_argument("--epss-file", type=Path)
     parser.add_argument("--sonar-status", type=Path, default=Path("sonar-status.json"))
@@ -631,17 +660,31 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("RISK_GATE_MODE", "report-only"),
     )
     args = parser.parse_args(argv)
+    workspace_root = Path.cwd().resolve(strict=True)
     try:
-        policy = load_policy(args.policy)
+        policy = load_policy(
+            args.policy,
+            workspace_root,
+            allow_external=args.allow_external_policy,
+        )
         report = decide(
             args.fs_report,
             args.image_report,
             policy=policy,
-            enricher=FeedEnricher(args.kev_file, args.epss_file),
+            enricher=FeedEnricher(
+                args.kev_file,
+                args.epss_file,
+                workspace_root=workspace_root,
+            ),
             sonar_status=args.sonar_status,
             sonar_configured=args.sonar_configured == "true",
+            workspace_root=workspace_root,
         )
-        args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        write_text(
+            args.output,
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            workspace_root,
+        )
     except (PolicyError, OSError) as exc:
         print(f"Risk Gate: unable to produce decision report ({exc}).", file=sys.stderr)
         return 2
