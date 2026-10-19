@@ -329,6 +329,7 @@ def test_github_summary_is_concise_and_redacted(tmp_path, monkeypatch):
 
 def run_cli_with_local_feeds(tmp_path, severity, mode, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SONAR_CONFIGURED", "false")
     fs, image = report_pair(
         tmp_path,
         [{"Target": "requirements.txt", "Vulnerabilities": [vuln(severity=severity)]}],
@@ -344,8 +345,14 @@ def run_cli_with_local_feeds(tmp_path, severity, mode, monkeypatch):
     exit_code = main([
         "--fs-report", str(fs), "--image-report", str(image), "--output", str(output),
         "--kev-file", str(kev), "--epss-file", str(epss), "--mode", mode,
+        "--sonar-configured", "false",
     ])
     report = json.loads(output.read_text(encoding="utf-8"))
+    degraded = report["degraded_data"]
+    assert degraded["degraded"] is False, (
+        "CLI run was degraded; expected complete KEV/EPSS and unconfigured Sonar. "
+        f"reasons={degraded.get('reasons')}"
+    )
     return report, exit_code
 
 
