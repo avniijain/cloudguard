@@ -2,7 +2,7 @@
 
 This repository contains a minimal Python Flask application used to validate the **CloudGuard** DevSecOps CI/CD pipeline.
 
-**Current phase:** build, test, SonarQube code quality, Docker image build, and Trivy scans. The CloudGuard Risk Gate, dashboard, Helm, and Kubernetes deploy are not implemented yet. Scan findings are collected as reports and do **not** block the pipeline.
+**Current phase:** build, test, SonarQube code quality, Docker image build, Trivy scans, and the CloudGuard Risk Gate. The gate starts in report-only mode unless the `RISK_GATE_MODE` Actions variable is set to `enforce`.
 
 ## Endpoints
 
@@ -42,7 +42,7 @@ The Docker image sets `FLASK_RUN_HOST=0.0.0.0` so the process is reachable throu
 ## Run tests
 
 ```bash
-pytest -v --cov=app --cov-report=term
+pytest -v --cov=app --cov=risk_gate --cov=sonar_status --cov-report=term
 ```
 
 ## Docker
@@ -62,10 +62,11 @@ On every push and pull request, GitHub Actions (`.github/workflows/ci.yml`) runs
 4. Docker image build
 5. Trivy filesystem scan (`vuln`, `secret`, `misconfig`)
 6. Trivy container image scan
-7. Upload JSON/SARIF reports as workflow artifacts
-8. Upload SARIF to the GitHub Security tab when GitHub Advanced Security is available
+7. Evaluate Trivy results and the SonarQube Quality Gate, writing `risk-decision.json`
+8. Upload scan reports and the risk decision as workflow artifacts
+9. Upload SARIF to the GitHub Security tab when GitHub Advanced Security is available
 
-Trivy `exit-code` is `0` on purpose: findings are recorded, not used as a merge gate. That comes later with the CloudGuard Risk Gate.
+Trivy `exit-code` is `0` on purpose: findings are evaluated by the CloudGuard Risk Gate rather than directly failing their scan steps. The gate initially reports its decision without failing CI. To enforce BLOCK decisions, set the repository or organization Actions variable `RISK_GATE_MODE` to `enforce`. See [docs/risk-gate.md](docs/risk-gate.md) for the policy, local usage, and limitations.
 
 ## Manual setup required
 
@@ -123,8 +124,14 @@ trivy image cloudguard-app:local
 ├── app/
 │   ├── app.py                 # Flask application
 │   └── test_app.py            # pytest tests
+├── tests/
+│   └── test_risk_gate.py      # Risk Gate and Sonar status tests
 ├── .github/workflows/
 │   └── ci.yml                 # Build, test, SonarQube, Trivy
+├── docs/
+│   └── risk-gate.md           # Risk policy and operation
+├── risk_gate.py               # Trivy aggregation, enrichment, and decision
+├── sonar_status.py            # Analysis-specific Sonar Quality Gate lookup
 ├── Dockerfile
 ├── sonar-project.properties
 ├── pytest.ini

@@ -18,6 +18,10 @@ htmlcov/
 .sonar/
 *.sarif
 trivy-reports/
+trivy-fs.json
+trivy-image.json
+risk-decision.json
+sonar-status.json
 
 # Environment
 .env

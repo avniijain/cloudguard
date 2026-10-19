@@ -13,8 +13,8 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     env:
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      SONAR_CONFIGURED: ${{ secrets.SONAR_TOKEN != '' }}
+      RISK_GATE_MODE: ${{ vars.RISK_GATE_MODE || 'report-only' }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -30,18 +30,28 @@ jobs:
         run: "pip install --require-hashes --only-binary=:all: -r requirements.txt"
 
       - name: Run tests with coverage
-        run: pytest -v --cov=app --cov-report=xml --cov-report=term
+        run: pytest -v --cov=app --cov=risk_gate --cov=sonar_status --cov-report=xml --cov-report=term
 
       - name: SonarQube / SonarCloud analysis
-        if: ${{ env.SONAR_TOKEN != '' }}
+        if: ${{ env.SONAR_CONFIGURED == 'true' }}
         uses: SonarSource/sonarqube-scan-action@1a6d90ebcb0e6a6b1d87e37ba693fe453195ae25 # v5.3.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           args: >
             -Dsonar.qualitygate.wait=false
             ${{ vars.SONAR_ORGANIZATION != '' && format('-Dsonar.organization={0}', vars.SONAR_ORGANIZATION) || '' }}
 
+      - name: Collect SonarQube Quality Gate status
+        if: ${{ always() && env.SONAR_CONFIGURED == 'true' }}
+        run: python sonar_status.py
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
       - name: Skip SonarQube if not configured
-        if: ${{ env.SONAR_TOKEN == '' }}
+        if: ${{ env.SONAR_CONFIGURED != 'true' }}
         run: |
           echo "SONAR_TOKEN is not set. Skipping SonarQube analysis."
           echo "Add repository secrets SONAR_TOKEN and SONAR_HOST_URL to enable this step."
@@ -91,7 +101,18 @@ jobs:
           exit-code: "0"
           ignore-unfixed: true
 
+      - name: Run CloudGuard Risk Gate
+        if: ${{ always() }}
+        run: >
+          python risk_gate.py
+          --fs-report trivy-fs.json
+          --image-report trivy-image.json
+          --sonar-status sonar-status.json
+          --sonar-configured "${SONAR_CONFIGURED}"
+          --mode "${RISK_GATE_MODE}"
+
       - name: Upload scan reports
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cloudguard-scan-reports
@@ -101,9 +122,12 @@ jobs:
             trivy-fs.sarif
             trivy-image.json
             trivy-image.sarif
+            risk-decision.json
+            sonar-status.json
           if-no-files-found: warn
 
       - name: Upload Trivy filesystem SARIF
+        if: ${{ always() }}
         uses: github/codeql-action/upload-sarif@51f77329afa6477de8c49fc9c7046c15b9a4e79d # v3.29.5
         continue-on-error: true
         with:
@@ -111,6 +135,7 @@ jobs:
           category: trivy-fs
 
       - name: Upload Trivy image SARIF
+        if: ${{ always() }}
         uses: github/codeql-action/upload-sarif@51f77329afa6477de8c49fc9c7046c15b9a4e79d # v3.29.5
         continue-on-error: true
         with:
