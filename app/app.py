@@ -10,7 +10,7 @@ def index():
     return jsonify({"message": "CloudGuard sample application", "service": "cloudguard-app"})
 
 
-@app.get("/health")
+@app.route("/health")
 def health():
     return jsonify({"status": "healthy"})
 
