@@ -10,9 +10,8 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 WORKDIR /app
 
 COPY requirements.txt .
-# Install deps, then remove the packaging tools the app never uses at runtime
-RUN pip install --no-cache-dir --upgrade "pip>=26.2.0" \
- && pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt \
+# Hash-locked, wheels only; then remove packaging tools not needed at runtime
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt \
  && pip uninstall -y pip setuptools wheel
 
 COPY app/ ./app/
