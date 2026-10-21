@@ -2,7 +2,7 @@ FROM python:3.13-slim
 
 # Pick up Debian security fix for liblzma5 (5.8.1-1+deb13u2 or later)
 RUN apt-get update \
- && apt-get install -y --only-upgrade liblzma5 \
+ && apt-get install -y --no-install-recommends --only-upgrade liblzma5 \
  && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
