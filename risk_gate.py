@@ -55,6 +55,18 @@ DEFAULT_POLICY: dict[str, Any] = {
     "block_on_sonar_unavailable": True,
 }
 
+# Hard floor for reusable-workflow callers: a supplied policy may not weaken these.
+POLICY_FLOOR_MAX_BLOCK_SCORE = 70
+POLICY_FLOOR_REQUIRED_TRUE = (
+    "block_on_critical",
+    "block_on_kev",
+    "block_on_secrets",
+    "block_on_missing_reports",
+    "block_on_enrichment_failure",
+    "block_on_sonar_security_failure",
+    "block_on_sonar_unavailable",
+)
+
 
 class PolicyError(ValueError):
     """Raised when a supplied policy is not usable."""
@@ -241,23 +253,62 @@ def _policy_with_overrides(overrides: Any) -> dict[str, Any]:
     return policy
 
 
+def validate_policy_floor(policy: dict[str, Any]) -> None:
+    """Reject a policy that weakens the reusable-workflow enforcement floor.
+
+    Callers may tighten controls (for example lower ``block_score``) but may not
+    raise ``block_score`` above 70, lower any ``severity_scores`` below the
+    defaults, or disable the listed hard-block flags.
+    """
+    violations: list[str] = []
+    block_score = policy.get("block_score")
+    if not isinstance(block_score, int) or block_score > POLICY_FLOOR_MAX_BLOCK_SCORE:
+        violations.append(
+            f"block_score must be an integer <= {POLICY_FLOOR_MAX_BLOCK_SCORE} "
+            f"(got {block_score!r})"
+        )
+    for key in POLICY_FLOOR_REQUIRED_TRUE:
+        if policy.get(key) is not True:
+            violations.append(f"{key} must be true (got {policy.get(key)!r})")
+    scores = policy.get("severity_scores")
+    if not isinstance(scores, dict):
+        violations.append("severity_scores must be an object")
+    else:
+        for severity, floor in DEFAULT_POLICY["severity_scores"].items():
+            value = scores.get(severity)
+            if not isinstance(value, int) or value < floor:
+                violations.append(
+                    f"severity_scores.{severity} must be an integer >= {floor} "
+                    f"(got {value!r})"
+                )
+    if violations:
+        raise PolicyError(
+            "policy weakens the enforce floor and was rejected: " + "; ".join(violations)
+        )
+
+
 def load_policy(
     path: Path | None,
     workspace_root: Path | None = None,
     *,
     allow_external: bool = False,
+    enforce_floor: bool = False,
 ) -> dict[str, Any]:
     if path is None:
-        return _policy_with_overrides({})
-    try:
-        value = json.loads(
-            read_text(path, workspace_root or Path.cwd(), allow_external=allow_external)
-        )
-    except PathSecurityError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise PolicyError("policy file could not be read or parsed") from exc
-    return _policy_with_overrides(value)
+        policy = _policy_with_overrides({})
+    else:
+        try:
+            value = json.loads(
+                read_text(path, workspace_root or Path.cwd(), allow_external=allow_external)
+            )
+        except PathSecurityError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PolicyError("policy file could not be read or parsed") from exc
+        policy = _policy_with_overrides(value)
+    if enforce_floor:
+        validate_policy_floor(policy)
+    return policy
 
 
 def _append_data_issue(issues: list[str], message: str) -> None:
@@ -646,6 +697,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Allow the explicitly selected policy JSON to reside outside the working directory.",
     )
+    parser.add_argument(
+        "--enforce-floor",
+        action="store_true",
+        help=(
+            "Reject a supplied policy that weakens the reusable-workflow floor "
+            "(block_score above 70, severity_scores below defaults, or disabling "
+            "required hard-block flags)."
+        ),
+    )
     parser.add_argument("--kev-file", type=Path)
     parser.add_argument("--epss-file", type=Path)
     parser.add_argument("--sonar-status", type=Path, default=Path("sonar-status.json"))
@@ -666,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
             args.policy,
             workspace_root,
             allow_external=args.allow_external_policy,
+            enforce_floor=args.enforce_floor,
         )
         report = decide(
             args.fs_report,

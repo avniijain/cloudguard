@@ -5,7 +5,18 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 import risk_gate
-from risk_gate import EPSS_URL, KEV_URL, FeedEnricher, FeedError, decide, load_policy, main
+from risk_gate import (
+    DEFAULT_POLICY,
+    EPSS_URL,
+    KEV_URL,
+    FeedEnricher,
+    FeedError,
+    PolicyError,
+    decide,
+    load_policy,
+    main,
+    validate_policy_floor,
+)
 from safe_paths import PathSecurityError, read_text, write_text
 from sonar_status import collect_status
 
@@ -256,6 +267,105 @@ def test_policy_can_disable_critical_hard_block(tmp_path):
     policy["block_on_critical"] = False
     result = run_decision(fs, image, policy=policy, enricher=FixtureEnricher(kev=set(), epss={"CVE-2025-12345": 0.01}))
     assert result["decision"] == "WARN"
+
+
+def test_enforce_floor_rejects_weakened_policy(tmp_path):
+    policy_path = tmp_path / "weak-policy.json"
+    policy_path.write_text(
+        json.dumps({"block_score": 90, "block_on_critical": False, "block_on_secrets": False}),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError, match="enforce floor"):
+        load_policy(policy_path, tmp_path, enforce_floor=True)
+    # Without the flag, the same weakened policy remains loadable (existing behavior).
+    loaded = load_policy(policy_path, tmp_path)
+    assert loaded["block_score"] == 90
+    assert loaded["block_on_critical"] is False
+
+
+def test_enforce_floor_accepts_default_and_stricter_policy(tmp_path):
+    validate_policy_floor(dict(DEFAULT_POLICY))
+    stricter = load_policy(None)
+    stricter["block_score"] = 50
+    validate_policy_floor(stricter)
+    policy_path = tmp_path / "strict-policy.json"
+    policy_path.write_text(json.dumps({"block_score": 50}), encoding="utf-8")
+    assert load_policy(policy_path, tmp_path, enforce_floor=True)["block_score"] == 50
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"block_score": 71},
+        {"block_on_critical": False},
+        {"block_on_kev": False},
+        {"block_on_secrets": False},
+        {"block_on_missing_reports": False},
+        {"block_on_enrichment_failure": False},
+        {"block_on_sonar_security_failure": False},
+        {"block_on_sonar_unavailable": False},
+    ],
+)
+def test_enforce_floor_rejects_each_restricted_weakening(tmp_path, override):
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(override), encoding="utf-8")
+    with pytest.raises(PolicyError, match="enforce floor"):
+        load_policy(policy_path, tmp_path, enforce_floor=True)
+
+
+def test_enforce_floor_cli_exits_two_on_weak_policy(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    fs, image = report_pair(tmp_path)
+    policy_path = tmp_path / "weak.json"
+    policy_path.write_text(json.dumps({"block_on_kev": False}), encoding="utf-8")
+    exit_code = main(
+        [
+            "--fs-report",
+            str(fs),
+            "--image-report",
+            str(image),
+            "--policy",
+            str(policy_path),
+            "--enforce-floor",
+            "--mode",
+            "enforce",
+        ]
+    )
+    assert exit_code == 2
+    assert "enforce floor" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("severity", list(DEFAULT_POLICY["severity_scores"]))
+def test_enforce_floor_rejects_severity_score_below_default(tmp_path, severity):
+    lowered = DEFAULT_POLICY["severity_scores"][severity] - 1
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"severity_scores": {severity: lowered}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError, match="enforce floor"):
+        load_policy(policy_path, tmp_path, enforce_floor=True)
+    loaded = load_policy(policy_path, tmp_path)
+    assert loaded["severity_scores"][severity] == lowered
+
+
+def test_enforce_floor_accepts_severity_scores_at_or_above_default(tmp_path):
+    raised = {name: points + 1 for name, points in DEFAULT_POLICY["severity_scores"].items()}
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps({"severity_scores": raised}), encoding="utf-8")
+    loaded = load_policy(policy_path, tmp_path, enforce_floor=True)
+    assert loaded["severity_scores"] == raised
+    validate_policy_floor(dict(DEFAULT_POLICY))
+
+
+def test_enforce_floor_rejects_sonar_security_failure_disabled(tmp_path):
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"block_on_sonar_security_failure": False}),
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError, match="block_on_sonar_security_failure"):
+        load_policy(policy_path, tmp_path, enforce_floor=True)
 
 
 def test_sonar_status_pass_fail_and_unconfigured_states(tmp_path):
