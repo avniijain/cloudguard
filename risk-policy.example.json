@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "severity_scores": {
+    "CRITICAL": 65,
+    "HIGH": 40,
+    "MEDIUM": 25,
+    "LOW": 8,
+    "UNKNOWN": 25
+  },
+  "secret_score": 80,
+  "kev_points": 25,
+  "epss": {
+    "high_threshold": 0.7,
+    "high_points": 15,
+    "medium_threshold": 0.3,
+    "medium_points": 8
+  },
+  "warn_score": 25,
+  "block_score": 70,
+  "block_on_critical": true,
+  "block_on_kev": true,
+  "block_on_secrets": true,
+  "block_on_missing_reports": true,
+  "block_on_enrichment_failure": true,
+  "block_on_sonar_security_failure": true,
+  "block_on_sonar_unavailable": true
+}
