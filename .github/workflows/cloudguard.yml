@@ -244,15 +244,12 @@ jobs:
           echo "image-tag=$tag" >> "$GITHUB_OUTPUT"
           echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
 
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image
         env:
-          DOCKERFILE: ${{ inputs.dockerfile }}
-          DOCKER_CONTEXT: ${{ inputs.docker-context }}
-        run: docker buildx build --load -f "$DOCKERFILE" -t "$IMAGE_TAG" "$DOCKER_CONTEXT"
+          DOCKERFILE_PATH: ${{ inputs.dockerfile }}
+          BUILD_CONTEXT: ${{ inputs.docker-context }}
+        run: docker build -f "$DOCKERFILE_PATH" -t "$IMAGE_TAG" "$BUILD_CONTEXT"
         
 
       - name: Trivy filesystem scan
