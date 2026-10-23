@@ -1,0 +1,362 @@
+name: CloudGuard Publish and Deploy
+
+# Reusable workflow (workflow_call). Publishes the image CloudGuard already scanned and,
+# optionally, deploys it to Azure Container Apps. No repository owner or name appears in
+# this file: everything application-specific arrives as an input.
+#
+# CALLER REQUIREMENTS
+#   * The calling job must grant: permissions: { contents: read, id-token: write }
+#   * The caller repo needs a GitHub environment matching the "environment" input.
+#   * Azure must trust exactly that repo + environment (see docs/azure-bootstrap.ps1).
+#   * v1 supports Azure Container Registry and Azure Container Apps only.
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: "Push the scanned image to the registry. Off unless the caller enables it."
+        type: boolean
+        required: false
+        default: false
+      deploy:
+        description: "Deploy the published image to Azure Container Apps. Off by default; requires publish."
+        type: boolean
+        required: false
+        default: false
+      decision:
+        description: "decision output of the CloudGuard scan workflow."
+        type: string
+        required: false
+        default: ""
+      risk-gate-mode:
+        description: "risk-gate-mode output of the CloudGuard scan workflow."
+        type: string
+        required: false
+        default: ""
+      image-tag:
+        description: "image-tag output of the scan workflow (local tag of the scanned image)."
+        type: string
+        required: false
+        default: ""
+      image-id:
+        description: "image-id output of the scan workflow; verified after the image is loaded."
+        type: string
+        required: false
+        default: ""
+      image-artifact:
+        description: "image-artifact output of the scan workflow (artifact holding the exported image)."
+        type: string
+        required: false
+        default: ""
+      registry:
+        description: "Azure Container Registry login server, for example myregistry.azurecr.io."
+        type: string
+        required: false
+        default: ""
+      image-repository:
+        description: "Repository name inside the registry, for example bookmarks-api."
+        type: string
+        required: false
+        default: ""
+      environment:
+        description: "GitHub environment used for publish and deploy jobs (must match the Azure trust)."
+        type: string
+        required: false
+        default: "production"
+      deploy-branch:
+        description: "Branch that is allowed to publish and deploy."
+        type: string
+        required: false
+        default: "main"
+      azure-client-id:
+        description: "Client ID of the identity this repository uses to sign in to Azure (not a secret)."
+        type: string
+        required: false
+        default: ""
+      azure-tenant-id:
+        description: "Azure tenant ID."
+        type: string
+        required: false
+        default: ""
+      azure-subscription-id:
+        description: "Azure subscription ID."
+        type: string
+        required: false
+        default: ""
+      resource-group:
+        description: "Resource group of the container app."
+        type: string
+        required: false
+        default: ""
+      container-app:
+        description: "Name of the existing container app."
+        type: string
+        required: false
+        default: ""
+      health-path:
+        description: "HTTP path that returns 2xx when the app is healthy."
+        type: string
+        required: false
+        default: "/health"
+      env-vars:
+        description: "Space-separated KEY=VALUE settings for the app. Use secretref:name for secrets."
+        type: string
+        required: false
+        default: ""
+    outputs:
+      image-ref:
+        description: "Published image reference pinned by digest."
+        value: ${{ jobs.publish.outputs.image-ref }}
+      revision:
+        description: "Name of the revision that was deployed."
+        value: ${{ jobs.deploy.outputs.revision }}
+      previous-revision:
+        description: "Revision that was live before this deployment."
+        value: ${{ jobs.deploy.outputs.previous-revision }}
+
+permissions: {}
+
+jobs:
+  gate:
+    name: Publish gate
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Check inputs and gate conditions
+        id: check
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          DEPLOY: ${{ inputs.deploy }}
+          DECISION: ${{ inputs.decision }}
+          MODE: ${{ inputs.risk-gate-mode }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          IMAGE_ID: ${{ inputs.image-id }}
+          IMAGE_ARTIFACT: ${{ inputs.image-artifact }}
+          REGISTRY: ${{ inputs.registry }}
+          REPOSITORY: ${{ inputs.image-repository }}
+          CLIENT_ID: ${{ inputs.azure-client-id }}
+          TENANT_ID: ${{ inputs.azure-tenant-id }}
+          SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+          RESOURCE_GROUP: ${{ inputs.resource-group }}
+          CONTAINER_APP: ${{ inputs.container-app }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEPLOY_REF: refs/heads/${{ inputs.deploy-branch }}
+        run: |
+          set -euo pipefail
+
+          finish() {
+            echo "proceed=$1" >> "$GITHUB_OUTPUT"
+            echo "### CloudGuard publish gate: proceed=$1 ($2)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          if [ "$DEPLOY" = "true" ] && [ "$PUBLISH" != "true" ]; then
+            echo "::error::deploy requires publish to be enabled"
+            exit 1
+          fi
+          if [ "$PUBLISH" != "true" ]; then
+            finish false "publish is not enabled"
+          fi
+
+          # Publishing was requested: validate configuration that does not depend on the scan.
+          missing=""
+          need() { for v in "$@"; do [ -n "${!v:-}" ] || missing="$missing $v"; done; }
+          need REGISTRY REPOSITORY CLIENT_ID TENANT_ID SUBSCRIPTION_ID
+          if [ "$DEPLOY" = "true" ]; then need RESOURCE_GROUP CONTAINER_APP; fi
+          if [ -n "$missing" ]; then
+            echo "::error::missing required inputs:$missing"
+            exit 1
+          fi
+
+          # Reject unexpected characters before any value reaches a docker or az command.
+          [[ "$REGISTRY" =~ ^[a-z0-9]{5,50}\.azurecr\.io$ ]] || { echo "::error::registry must be an Azure Container Registry login server"; exit 1; }
+          [[ "$REPOSITORY" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || { echo "::error::invalid image-repository"; exit 1; }
+          if [ "$DEPLOY" = "true" ]; then
+            [[ "$RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]+$ ]] || { echo "::error::invalid resource-group"; exit 1; }
+            [[ "$CONTAINER_APP" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::invalid container-app"; exit 1; }
+            [[ "$HEALTH_PATH" =~ ^/[A-Za-z0-9._/-]*$ ]] || { echo "::error::invalid health-path"; exit 1; }
+          fi
+
+          # Hard rules. Callers cannot relax these.
+          if [ "$EVENT" != "push" ] && [ "$EVENT" != "workflow_dispatch" ]; then
+            finish false "event $EVENT never publishes"
+          fi
+          if [ "$REF" != "$DEPLOY_REF" ]; then
+            finish false "$REF is not $DEPLOY_REF"
+          fi
+          if [ "$MODE" != "enforce" ]; then
+            finish false "risk-gate-mode is $MODE, publishing needs enforce"
+          fi
+          if [ "$DECISION" != "ALLOW" ]; then
+            finish false "risk decision is $DECISION, publishing needs ALLOW"
+          fi
+
+          # Scan-derived inputs: required only after hard rules pass.
+          missing=""
+          need IMAGE_TAG IMAGE_ID IMAGE_ARTIFACT
+          if [ -n "$missing" ]; then
+            echo "::error::the scan did not export the image (missing:$missing). Did the caller set export-image?"
+            exit 1
+          fi
+          finish true "ALLOW in enforce mode on $REF"
+
+  publish:
+    name: Publish scanned image
+    needs: gate
+    if: ${{ needs.gate.outputs.proceed == 'true' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image-ref: ${{ steps.push.outputs.image-ref }}
+    steps:
+      - name: Download the scanned image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.image-artifact }}
+          path: ${{ runner.temp }}/scanned
+
+      - name: Load image and verify it is the scanned one
+        env:
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          EXPECTED_ID: ${{ inputs.image-id }}
+        run: |
+          set -euo pipefail
+          docker load -i "$RUNNER_TEMP/scanned/cloudguard-image.tar"
+          actual=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG")
+          if [ "$actual" != "$EXPECTED_ID" ]; then
+            echo "::error::loaded image ID $actual does not match scanned image ID $EXPECTED_ID"
+            exit 1
+          fi
+
+      - name: Sign in to Azure (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Push image
+        id: push
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          REPOSITORY: ${{ inputs.image-repository }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          set -euo pipefail
+          az acr login --name "${REGISTRY%%.*}"
+          target="$REGISTRY/$REPOSITORY:$GITHUB_SHA"
+          docker tag "$IMAGE_TAG" "$target"
+          docker push "$target"
+          digest=$(az acr repository show --name "${REGISTRY%%.*}" --image "$REPOSITORY:$GITHUB_SHA" --query digest -o tsv)
+          echo "image-ref=$REGISTRY/$REPOSITORY@$digest" >> "$GITHUB_OUTPUT"
+          echo "### Published $REGISTRY/$REPOSITORY@$digest" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to Azure Container Apps
+    needs: [gate, publish]
+    if: ${{ inputs.deploy && needs.gate.outputs.proceed == 'true' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: cloudguard-deploy-${{ inputs.resource-group }}-${{ inputs.container-app }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      revision: ${{ steps.release.outputs.revision }}
+      previous-revision: ${{ steps.release.outputs.previous }}
+    steps:
+      - name: Sign in to Azure (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Release new revision (0 percent, health check, shift, auto-rollback)
+        id: release
+        env:
+          RESOURCE_GROUP: ${{ inputs.resource-group }}
+          APP: ${{ inputs.container-app }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          ENV_VARS: ${{ inputs.env-vars }}
+          IMAGE_REF: ${{ needs.publish.outputs.image-ref }}
+        run: |
+          set -euo pipefail
+          az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
+          az extension add --name containerapp --upgrade --only-show-errors
+
+          suffix="g${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          new="$APP--$suffix"
+
+          # 1. Find the live revision.
+          prev=$(az containerapp ingress traffic show -n "$APP" -g "$RESOURCE_GROUP" -o json \
+                 | jq -r '[.[] | select(.weight == 100)][0].revisionName // empty')
+          if [ -z "$prev" ]; then
+            prev=$(az containerapp show -n "$APP" -g "$RESOURCE_GROUP" --query properties.latestReadyRevisionName -o tsv)
+          fi
+          [ "$prev" = "None" ] && prev=""
+
+          # 2. Pin all traffic to it so the new revision starts at 0 percent.
+          if [ -n "$prev" ]; then
+            az containerapp ingress traffic set -n "$APP" -g "$RESOURCE_GROUP" --revision-weight "$prev=100" -o none
+          fi
+
+          # 3. Create the new revision from the published, digest-pinned image.
+          args=(--image "$IMAGE_REF" --revision-suffix "$suffix")
+          if [ -n "$ENV_VARS" ]; then
+            read -r -a ev <<< "$ENV_VARS"
+            args+=(--set-env-vars "${ev[@]}")
+          fi
+          az containerapp update -n "$APP" -g "$RESOURCE_GROUP" "${args[@]}" -o none
+
+          echo "revision=$new" >> "$GITHUB_OUTPUT"
+          echo "previous=$prev" >> "$GITHUB_OUTPUT"
+
+          # 4. Health-check the new revision on its own URL while it has no traffic.
+          fqdn=$(az containerapp revision show -n "$APP" -g "$RESOURCE_GROUP" --revision "$new" --query properties.fqdn -o tsv)
+          if [ -z "$fqdn" ] || [ "$fqdn" = "None" ]; then
+            echo "::error::could not determine the URL of revision $new; traffic left on $prev"
+            exit 1
+          fi
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 5 "https://$fqdn$HEALTH_PATH" >/dev/null; then ok=1; break; fi
+            sleep 6
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::revision $new failed its health check; traffic left on ${prev:-nothing}"
+            exit 1
+          fi
+
+          # 5. Shift traffic, re-check through the public URL, roll back on failure.
+          az containerapp ingress traffic set -n "$APP" -g "$RESOURCE_GROUP" --revision-weight "$new=100" -o none
+          public=$(az containerapp show -n "$APP" -g "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          ok=""
+          for _ in $(seq 1 10); do
+            if curl -fsS --max-time 5 "https://$public$HEALTH_PATH" >/dev/null; then ok=1; break; fi
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            if [ -n "$prev" ]; then
+              az containerapp ingress traffic set -n "$APP" -g "$RESOURCE_GROUP" --revision-weight "$prev=100" -o none
+              echo "::error::public health check failed; rolled back to $prev"
+            else
+              echo "::error::public health check failed and there is no previous revision"
+            fi
+            exit 1
+          fi
+
+          {
+            echo "### Deployed $new"
+            echo "- previous revision: ${prev:-none}"
+            echo "- image: $IMAGE_REF"
+          } >> "$GITHUB_STEP_SUMMARY"

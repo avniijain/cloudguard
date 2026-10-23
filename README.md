@@ -68,6 +68,8 @@ On every push and pull request, GitHub Actions (`.github/workflows/ci.yml`) runs
 
 Trivy `exit-code` is `0` on purpose: findings are evaluated by the CloudGuard Risk Gate rather than directly failing their scan steps. The gate initially reports its decision without failing CI. To enforce BLOCK decisions, set the repository or organization Actions variable `RISK_GATE_MODE` to `enforce`. See [docs/risk-gate.md](docs/risk-gate.md) for the policy, local usage, and limitations.
 
+To call CloudGuard from another repository, including optional publish and deploy to Azure Container Apps, see [docs/using-cloudguard.md](docs/using-cloudguard.md).
+
 ## Manual setup required
 
 GitHub Actions cannot create a SonarQube/SonarCloud project or tokens for you. Complete these once per repository.
