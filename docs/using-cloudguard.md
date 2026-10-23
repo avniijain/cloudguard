@@ -29,21 +29,37 @@ jobs:
     uses: avniijain/cloudguard/.github/workflows/cloudguard.yml@v1  # pin a tag or SHA
     with:
       image-name: my-app
+      export-image: ${{ github.event_name != 'pull_request' }}  # only needed for publishing
       # Optional: keep in sync with the @ref above if you override checkout.
       # cloudguard-ref: v1
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-  # Example: refuse deploy unless the gate ran in enforce mode and allowed.
-  deploy:
+  # Optional: publish the scanned image and deploy it to Azure Container Apps.
+  # Needs the one-time Azure setup described in "Publishing and deploying" below.
+  publish-deploy:
     needs: cloudguard
-    if: |
-      needs.cloudguard.outputs.risk-gate-mode == 'enforce' &&
-      needs.cloudguard.outputs.decision == 'ALLOW'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "Deploying ${{ needs.cloudguard.outputs.image-tag }}"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: avniijain/cloudguard/.github/workflows/cloudguard-publish.yml@v1  # same ref as above
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      publish: false   # set true to enable
+      deploy: false    # set true to enable (requires publish)
+      decision: ${{ needs.cloudguard.outputs.decision }}
+      risk-gate-mode: ${{ needs.cloudguard.outputs.risk-gate-mode }}
+      image-tag: ${{ needs.cloudguard.outputs.image-tag }}
+      image-id: ${{ needs.cloudguard.outputs.image-id }}
+      image-artifact: ${{ needs.cloudguard.outputs.image-artifact }}
+      registry: ${{ vars.ACR_LOGIN_SERVER }}
+      image-repository: my-app
+      azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      resource-group: ${{ vars.AZURE_RESOURCE_GROUP }}
+      container-app: ${{ vars.AZURE_CONTAINER_APP }}
 ```
 
 Replace `avniijain/cloudguard` and `@v1` with the CloudGuard repository and the
@@ -95,6 +111,7 @@ workflow). The reusable workflow also declares the same minimum set:
 | `artifact-name`       | string  | `"cloudguard-scan-reports"` | Artifact name (unique per call if you invoke CloudGuard more than once) |
 | `cloudguard-ref`      | string  | `""`                      | Override checkout ref for gate scripts; empty = `job.workflow_sha` |
 | `sonar-organization`  | string  | `""`                      | SonarCloud organization key; passed as `-Dsonar.organization` when set |
+| `export-image`        | boolean | `false`                   | Export the scanned image as an artifact so it can be published without rebuilding |
 
 The reusable workflow always passes `--enforce-floor` to the Risk Gate so a
 caller policy cannot weaken the floor (see below).
@@ -140,6 +157,105 @@ Or use `secrets: inherit` when the caller and organization allow it.
 | `risk-score`     | Aggregate score 0–100 |
 | `image-tag`      | Built image reference (`image-name:sha`) |
 | `risk-gate-mode` | Mode used for this run (`enforce` or `report-only`) |
+| `image-id`       | Image ID of the scanned image, verified again before publishing |
+| `image-artifact` | Name of the artifact holding the exported image |
+
+## Publishing and deploying to Azure (optional)
+
+[`cloudguard-publish.yml`](../.github/workflows/cloudguard-publish.yml) is a separate
+reusable workflow. Off by default (`publish: false`, `deploy: false`). When enabled
+it takes the image CloudGuard already scanned (no rebuild), verifies the image ID,
+pushes it to Azure Container Registry, then optionally creates a new Container Apps
+revision at 0% traffic, health-checks it, shifts traffic, and rolls back automatically
+if the public health check fails.
+
+### Hard rules (callers cannot relax these)
+
+Publishing only proceeds when **all** of the following hold:
+
+- Event is `push` or `workflow_dispatch` (never a pull request)
+- Ref is `refs/heads/<deploy-branch>` (`deploy-branch` defaults to `main`)
+- `risk-gate-mode` is `enforce`
+- `decision` is `ALLOW`
+
+`WARN` and `BLOCK` never publish or deploy. Enabling `deploy` without `publish` fails
+the gate.
+
+### Caller requirements
+
+- The calling job must grant `permissions: { contents: read, id-token: write }`
+- Create a GitHub environment (default name `production`) restricted to the deploy
+  branch
+- Pass Azure IDs as repository **variables**, not secrets
+- v1 supports **Azure Container Registry** and **Azure Container Apps** only
+
+### `cloudguard-publish.yml` inputs
+
+| Input                 | Type    | Default         | Description |
+|-----------------------|---------|-----------------|-------------|
+| `publish`             | boolean | `false`         | Push the scanned image to the registry. Off unless the caller enables it. |
+| `deploy`              | boolean | `false`         | Deploy the published image to Azure Container Apps. Off by default; requires publish. |
+| `decision`            | string  | `""`            | `decision` output of the CloudGuard scan workflow. |
+| `risk-gate-mode`      | string  | `""`            | `risk-gate-mode` output of the CloudGuard scan workflow. |
+| `image-tag`           | string  | `""`            | `image-tag` output of the scan workflow (local tag of the scanned image). |
+| `image-id`            | string  | `""`            | `image-id` output of the scan workflow; verified after the image is loaded. |
+| `image-artifact`      | string  | `""`            | `image-artifact` output of the scan workflow (artifact holding the exported image). |
+| `registry`            | string  | `""`            | Azure Container Registry login server, for example `myregistry.azurecr.io`. |
+| `image-repository`    | string  | `""`            | Repository name inside the registry, for example `bookmarks-api`. |
+| `environment`         | string  | `"production"`  | GitHub environment used for publish and deploy jobs (must match the Azure trust). |
+| `deploy-branch`       | string  | `"main"`        | Branch that is allowed to publish and deploy. |
+| `azure-client-id`     | string  | `""`            | Client ID of the identity this repository uses to sign in to Azure (not a secret). |
+| `azure-tenant-id`     | string  | `""`            | Azure tenant ID. |
+| `azure-subscription-id` | string | `""`           | Azure subscription ID. |
+| `resource-group`      | string  | `""`            | Resource group of the container app. |
+| `container-app`       | string  | `""`            | Name of the existing container app. |
+| `health-path`         | string  | `"/health"`     | HTTP path that returns 2xx when the app is healthy. |
+| `env-vars`            | string  | `""`            | Space-separated `KEY=VALUE` settings for the app. Use `secretref:name` for secrets. |
+
+Outputs: `image-ref` (digest-pinned published reference), `revision`, `previous-revision`.
+
+### One-time Azure setup
+
+Run [`docs/azure-bootstrap.ps1`](azure-bootstrap.ps1) once per consuming repository
+(after the resource group, registry, and AcrPull identity already exist):
+
+```powershell
+.\docs\azure-bootstrap.ps1 -GitHubOwner OWNER -GitHubRepo REPO `
+    -ResourceGroup rg-example -AcrName myregistry -Location centralindia `
+    -ContainerApp my-app -TargetPort 8000
+```
+
+It prints repository variables to set (not secrets):
+
+- `AZURE_CLIENT_ID`
+- `AZURE_TENANT_ID`
+- `AZURE_SUBSCRIPTION_ID`
+- `ACR_LOGIN_SERVER`
+- `AZURE_RESOURCE_GROUP`
+- `AZURE_CONTAINER_APP`
+
+Then create the matching GitHub environment and restrict it to the deploy branch.
+
+### Security model
+
+Azure trusts exactly one repository and one environment via a federated credential
+subject of the form `repo:OWNER/REPO:environment:NAME`. No wildcards. One deployer
+identity per consuming repo. CloudGuard stores no Azure credentials; the caller signs
+in with OIDC (`id-token: write`).
+
+### Required vs optional files in a consuming repo
+
+| File / capability | Required? |
+|-------------------|-----------|
+| `Dockerfile` | **Required** |
+| HTTP health endpoint (default `/health`) | **Required** for deploy |
+| `sonar-project.properties` | Optional |
+| Risk Gate policy file | Optional |
+
+### Cost
+
+The container app is created with min replicas `0` (scales to zero). Delete the
+resource group when you are finished to avoid ongoing charges.
 
 ## Example policy and the enforce floor
 

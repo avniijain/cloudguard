@@ -8,6 +8,9 @@
 # scripts match the reusable workflow revision pinned in `uses:` (see GitHub docs
 # for job.workflow_*). The optional cloudguard-ref input overrides the SHA when set.
 # job.workflow_* is not available on GitHub Enterprise Server; on GHES set cloudguard-ref.
+#
+# export-image is only needed when the caller also uses cloudguard-publish.yml.
+# The file name inside the artifact must stay cloudguard-image.tar.
 
 name: CloudGuard
 
@@ -73,6 +76,11 @@ on:
         type: string
         required: false
         default: ""
+      export-image:
+        description: Export the scanned image as an artifact so it can be published without rebuilding
+        type: boolean
+        required: false
+        default: false
     secrets:
       SONAR_TOKEN:
         description: SonarQube/SonarCloud token; when absent, Sonar steps are skipped cleanly
@@ -93,6 +101,12 @@ on:
       risk-gate-mode:
         description: Mode the gate ran under (enforce or report-only); deploy jobs should require enforce
         value: ${{ jobs.cloudguard.outputs.risk-gate-mode }}
+      image-id:
+        description: Image ID of the scanned image, verified again before publishing
+        value: ${{ jobs.cloudguard.outputs.image-id }}
+      image-artifact:
+        description: Name of the artifact holding the exported image
+        value: ${{ jobs.cloudguard.outputs.image-artifact }}
 
 permissions:
   contents: read
@@ -106,6 +120,8 @@ jobs:
       risk-score: ${{ steps.gate_outputs.outputs.risk-score }}
       image-tag: ${{ steps.image_meta.outputs.image-tag }}
       risk-gate-mode: ${{ steps.mode_meta.outputs.risk-gate-mode }}
+      image-id: ${{ steps.export_image.outputs.image-id }}
+      image-artifact: ${{ steps.export_image.outputs.artifact }}
     env:
       SONAR_CONFIGURED: ${{ secrets.SONAR_TOKEN != '' }}
       RISK_GATE_MODE: ${{ inputs.risk-gate-mode }}
@@ -327,6 +343,26 @@ jobs:
           fi
           echo "decision=$decision" >> "$GITHUB_OUTPUT"
           echo "risk-score=$score" >> "$GITHUB_OUTPUT"
+
+      - name: Export scanned image
+        id: export_image
+        if: ${{ inputs.export-image && steps.gate_outputs.outputs.decision == 'ALLOW' }}
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}-image-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker save "$IMAGE_TAG" -o "$RUNNER_TEMP/cloudguard-image.tar"
+          echo "image-id=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG")" >> "$GITHUB_OUTPUT"
+          echo "artifact=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload scanned image
+        if: ${{ steps.export_image.outputs.artifact != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.export_image.outputs.artifact }}
+          path: ${{ runner.temp }}/cloudguard-image.tar
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Upload scan reports
         if: ${{ always() }}
