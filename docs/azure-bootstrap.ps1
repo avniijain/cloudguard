@@ -15,9 +15,9 @@
   Prerequisites: resource group, registry and the pull identity (AcrPull) already exist.
 
 .EXAMPLE
-  .\azure-bootstrap.ps1 -GitHubOwner avniijain -GitHubRepo cloudguard-demo `
-      -ResourceGroup rg-cloudguard-demo -AcrName myregistry -Location centralindia `
-      -ContainerApp bookmarks-api -TargetPort 8000
+  .\azure-bootstrap.ps1 -GitHubOwner <githubOwner> -GitHubRepo <repositoryName> `
+      -ResourceGroup <resourceGroupName> -AcrName <acrName> -Location <location> `
+      -ContainerApp <containerAppName> -TargetPort <targetPort>
 #>
 [CmdletBinding()]
 param(
