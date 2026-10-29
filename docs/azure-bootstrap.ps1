@@ -15,9 +15,9 @@
   Prerequisites: resource group, registry and the pull identity (AcrPull) already exist.
 
 .EXAMPLE
-  .\azure-bootstrap.ps1 -GitHubOwner <githubOwner> -GitHubRepo <repositoryName> `
-      -ResourceGroup <resourceGroupName> -AcrName <acrName> -Location <location> `
-      -ContainerApp <containerAppName> -TargetPort <targetPort>
+  .\azure-bootstrap.ps1 -GitHubOwner <owner> -GitHubRepo <repo> `
+      -ResourceGroup <resourceGroup> -AcrName <acrName> -Location <location> `
+      -ContainerApp <containerApp> -TargetPort 8000
 #>
 [CmdletBinding()]
 param(
@@ -31,8 +31,12 @@ param(
   [string]$ContainerAppsEnv = 'cae-cloudguard',
   [string]$PullIdentity = 'id-cg-pull',
   [int]$TargetPort = 8000,
-  [string]$PlaceholderImage = 'mcr.microsoft.com/k8se/quickstart:latest'
+  [string]$PlaceholderImage = 'mcr.microsoft.com/k8se/quickstart:latest',
+  [string]$Subject = '',
+  [switch]$UseNumericIds
 )
+
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw "Azure CLI (az) not found on PATH. Open a terminal where 'az' works." }
 
 # Native-command failures are checked through $LASTEXITCODE, not exceptions.
 $ErrorActionPreference = 'Continue'
@@ -50,22 +54,28 @@ function Test-AzCli {
 $tenantId = Invoke-AzCli account show --query tenantId -o tsv
 $subscriptionId = Invoke-AzCli account show --query id -o tsv
 
+if (-not (Test-AzCli group show -n $ResourceGroup)) { throw "Resource group $ResourceGroup not found." }
+if (-not (Test-AzCli acr show -n $AcrName)) { throw "Registry $AcrName not found." }
+if (-not (Test-AzCli identity show -n $PullIdentity -g $ResourceGroup)) { throw "Pull identity $PullIdentity not found." }
+
+$loginServer = Invoke-AzCli acr show -n $AcrName --query loginServer -o tsv
+$acrId = Invoke-AzCli acr show -n $AcrName --query id -o tsv
+$pullId = Invoke-AzCli identity show -n $PullIdentity -g $ResourceGroup --query id -o tsv
+$pullPrincipalId = Invoke-AzCli identity show -n $PullIdentity -g $ResourceGroup --query principalId -o tsv
+$acrPull = @(Invoke-AzCli role assignment list --assignee-object-id $pullPrincipalId --scope $acrId --role AcrPull -o json | ConvertFrom-Json)
+if ($acrPull.Count -eq 0) {
+  throw "Pull identity $PullIdentity is missing the AcrPull role on registry $AcrName."
+}
+
 Write-Host "Registering providers and the containerapp extension..."
 foreach ($ns in 'Microsoft.App', 'Microsoft.OperationalInsights', 'Microsoft.ContainerRegistry', 'Microsoft.ManagedIdentity') {
   Invoke-AzCli provider register --namespace $ns --wait | Out-Null
 }
 Invoke-AzCli extension add --name containerapp --upgrade --only-show-errors | Out-Null
 
-if (-not (Test-AzCli group show -n $ResourceGroup)) { throw "Resource group $ResourceGroup not found." }
-if (-not (Test-AzCli acr show -n $AcrName)) { throw "Registry $AcrName not found." }
-if (-not (Test-AzCli identity show -n $PullIdentity -g $ResourceGroup)) { throw "Pull identity $PullIdentity not found." }
-
-$loginServer = Invoke-AzCli acr show -n $AcrName --query loginServer -o tsv
-$pullId = Invoke-AzCli identity show -n $PullIdentity -g $ResourceGroup --query id -o tsv
-
 Write-Host "Container Apps environment..."
 if (-not (Test-AzCli containerapp env show -n $ContainerAppsEnv -g $ResourceGroup)) {
-  Invoke-AzCli containerapp env create -n $ContainerAppsEnv -g $ResourceGroup -l $Location | Out-Null
+  Invoke-AzCli containerapp env create -n $ContainerAppsEnv -g $ResourceGroup -l $Location --environment-mode WorkloadProfiles | Out-Null
 }
 
 Write-Host "Container app..."
@@ -88,7 +98,15 @@ $clientId = Invoke-AzCli identity show -n $deployName -g $ResourceGroup --query 
 $principalId = Invoke-AzCli identity show -n $deployName -g $ResourceGroup --query principalId -o tsv
 
 # Exactly one repository and one environment. No wildcards.
-$subject = "repo:${GitHubOwner}/${GitHubRepo}:environment:${Environment}"
+if ($Subject) {
+  $subject = $Subject
+} elseif ($UseNumericIds) {
+  $repoInfo = Invoke-RestMethod "https://api.github.com/repos/$GitHubOwner/$GitHubRepo"
+  $subject = "repo:${GitHubOwner}@$($repoInfo.owner.id)/${GitHubRepo}@$($repoInfo.id):environment:${Environment}"
+} else {
+  $subject = "repo:${GitHubOwner}/${GitHubRepo}:environment:${Environment}"
+}
+Write-Host "Federated credential subject: $subject"
 $credName = "github-$Environment"
 $credArgs = @('--name', $credName, '--identity-name', $deployName, '--resource-group', $ResourceGroup,
               '--issuer', 'https://token.actions.githubusercontent.com',
@@ -101,7 +119,6 @@ if (Test-AzCli identity federated-credential show --name $credName --identity-na
 
 Write-Host "Role assignments (scoped to this resource group and registry)..."
 $rgId = Invoke-AzCli group show -n $ResourceGroup --query id -o tsv
-$acrId = Invoke-AzCli acr show -n $AcrName --query id -o tsv
 Invoke-AzCli role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role Contributor --scope $rgId | Out-Null
 Invoke-AzCli role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role AcrPush --scope $acrId | Out-Null
 

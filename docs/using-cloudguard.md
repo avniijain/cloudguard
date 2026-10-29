@@ -216,12 +216,32 @@ Outputs: `image-ref` (digest-pinned published reference), `revision`, `previous-
 
 ### One-time Azure setup
 
-Run [`docs/azure-bootstrap.ps1`](azure-bootstrap.ps1) once per consuming repository
-(after the resource group, registry, and AcrPull identity already exist):
+Prerequisites (create these first if they do not exist): a resource group, an Azure
+Container Registry, and a user-assigned identity named `id-cg-pull` with the
+**AcrPull** role on that registry.
+
+```powershell
+az group create -n rg-example -l uaenorth
+az acr create -n myregistry -g rg-example --sku Basic
+az identity create -n id-cg-pull -g rg-example
+$principalId = az identity show -n id-cg-pull -g rg-example --query principalId -o tsv
+$acrId = az acr show -n myregistry --query id -o tsv
+az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role AcrPull --scope $acrId
+```
+
+The `-Location` passed to the bootstrap (Container Apps environment) must support
+Azure Container Apps and be allowed by the subscription's policy (for example
+`uaenorth`, `malaysiawest`, `polandcentral`). The pull identity and ACR can be in
+another region.
+
+Run [`docs/azure-bootstrap.ps1`](azure-bootstrap.ps1) once per consuming repository.
+Optional: `-Subject` to set the federated credential subject explicitly, or
+`-UseNumericIds` to build `repo:OWNER@<owner.id>/REPO@<id>:environment:NAME` from
+the GitHub API (needed when GitHub's OIDC token uses numeric IDs).
 
 ```powershell
 .\docs\azure-bootstrap.ps1 -GitHubOwner OWNER -GitHubRepo REPO `
-    -ResourceGroup rg-example -AcrName myregistry -Location centralindia `
+    -ResourceGroup rg-example -AcrName myregistry -Location uaenorth `
     -ContainerApp my-app -TargetPort 8000
 ```
 
@@ -235,6 +255,12 @@ It prints repository variables to set (not secrets):
 - `AZURE_CONTAINER_APP`
 
 Then create the matching GitHub environment and restrict it to the deploy branch.
+
+If `azure/login` fails with `AADSTS700213`, compare the "subject claim" printed in
+the login log with the federated credential's subject. If the log shows owner/repo
+IDs (`repo:OWNER@ID/REPO@ID:environment:NAME`), re-run the bootstrap with
+`-UseNumericIds` or update the credential with
+`az identity federated-credential update --subject`.
 
 ### Security model
 
