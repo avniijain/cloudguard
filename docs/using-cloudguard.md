@@ -283,6 +283,52 @@ in with OIDC (`id-token: write`).
 The container app is created with min replicas `0` (scales to zero). Delete the
 resource group when you are finished to avoid ongoing charges.
 
+## Manual rollback
+
+[`cloudguard-rollback.yml`](../.github/workflows/cloudguard-rollback.yml) shifts
+traffic to an existing Container Apps revision. It shares the deploy concurrency
+group, so a rollback cannot overlap a deploy. The gate only allows
+`workflow_dispatch` on `refs/heads/<deploy-branch>` (default `main`). The
+`revision` input must match `^[a-z0-9][a-z0-9.-]{0,62}$`.
+
+List revisions, then pick one that is not currently at 100% traffic:
+
+```powershell
+az containerapp revision list -n <container-app> -g <resource-group> -o table
+```
+
+Create `.github/workflows/rollback.yml` in the consumer repository:
+
+```yaml
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Container Apps revision to roll back to
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    uses: avniijain/cloudguard/.github/workflows/cloudguard-rollback.yml@v1.1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      revision: ${{ inputs.revision }}
+      azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      resource-group: ${{ vars.AZURE_RESOURCE_GROUP }}
+      container-app: ${{ vars.AZURE_CONTAINER_APP }}
+```
+
+Replace `avniijain/cloudguard` with the CloudGuard repository you use. After a
+successful rollback the previous image is still the tip of `main`; fix forward
+or revert that commit.
+
 ## Example policy and the enforce floor
 
 Copy [`risk-policy.example.json`](../risk-policy.example.json) (generated from

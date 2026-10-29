@@ -1,0 +1,224 @@
+name: CloudGuard Rollback
+
+# Reusable workflow (workflow_call). Shifts Azure Container Apps traffic to an
+# existing revision. No repository owner or name appears in this file: everything
+# application-specific arrives as an input.
+#
+# CALLER REQUIREMENTS
+#   * Trigger with workflow_dispatch (the gate fails any other event).
+#   * The calling job must grant: permissions: { contents: read, id-token: write }
+#   * The caller repo needs a GitHub environment matching the "environment" input.
+#   * Azure must trust exactly that repo + environment (see docs/azure-bootstrap.ps1).
+#   * v1 supports Azure Container Apps only.
+
+on:
+  workflow_call:
+    inputs:
+      revision:
+        description: "Container Apps revision name to roll back to."
+        type: string
+        required: true
+      environment:
+        description: "GitHub environment used for the rollback job (must match the Azure trust)."
+        type: string
+        required: false
+        default: "production"
+      deploy-branch:
+        description: "Branch that is allowed to roll back."
+        type: string
+        required: false
+        default: "main"
+      azure-client-id:
+        description: "Client ID of the identity this repository uses to sign in to Azure (not a secret)."
+        type: string
+        required: false
+        default: ""
+      azure-tenant-id:
+        description: "Azure tenant ID."
+        type: string
+        required: false
+        default: ""
+      azure-subscription-id:
+        description: "Azure subscription ID."
+        type: string
+        required: false
+        default: ""
+      resource-group:
+        description: "Resource group of the container app."
+        type: string
+        required: false
+        default: ""
+      container-app:
+        description: "Name of the existing container app."
+        type: string
+        required: false
+        default: ""
+      health-path:
+        description: "HTTP path that returns 2xx when the app is healthy."
+        type: string
+        required: false
+        default: "/health"
+    outputs:
+      revision:
+        description: "Name of the revision that traffic was rolled back to."
+        value: ${{ jobs.rollback.outputs.revision }}
+      previous-revision:
+        description: "Revision that was live before this rollback."
+        value: ${{ jobs.rollback.outputs.previous-revision }}
+
+permissions: {}
+
+jobs:
+  gate:
+    name: Rollback gate
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check inputs and gate conditions
+        env:
+          REVISION: ${{ inputs.revision }}
+          CLIENT_ID: ${{ inputs.azure-client-id }}
+          TENANT_ID: ${{ inputs.azure-tenant-id }}
+          SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+          RESOURCE_GROUP: ${{ inputs.resource-group }}
+          CONTAINER_APP: ${{ inputs.container-app }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEPLOY_REF: refs/heads/${{ inputs.deploy-branch }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "::error::rollback is only allowed on workflow_dispatch (got $EVENT)"
+            exit 1
+          fi
+          if [ "$REF" != "$DEPLOY_REF" ]; then
+            echo "::error::$REF is not $DEPLOY_REF"
+            exit 1
+          fi
+
+          missing=""
+          need() { for v in "$@"; do [ -n "${!v:-}" ] || missing="$missing $v"; done; }
+          need REVISION CLIENT_ID TENANT_ID SUBSCRIPTION_ID RESOURCE_GROUP CONTAINER_APP
+          if [ -n "$missing" ]; then
+            echo "::error::missing required inputs:$missing"
+            exit 1
+          fi
+
+          # Reject unexpected characters before any value reaches an az command.
+          [[ "$REVISION" =~ ^[a-z0-9][a-z0-9.-]{0,62}$ ]] || { echo "::error::invalid revision"; exit 1; }
+          [[ "$RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]+$ ]] || { echo "::error::invalid resource-group"; exit 1; }
+          [[ "$CONTAINER_APP" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::invalid container-app"; exit 1; }
+          [[ "$HEALTH_PATH" =~ ^/[A-Za-z0-9._/-]*$ ]] || { echo "::error::invalid health-path"; exit 1; }
+
+          echo "### CloudGuard rollback gate: ok" >> "$GITHUB_STEP_SUMMARY"
+
+  rollback:
+    name: Roll back Azure Container Apps revision
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: cloudguard-deploy-${{ inputs.resource-group }}-${{ inputs.container-app }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      revision: ${{ steps.rollback.outputs.revision }}
+      previous-revision: ${{ steps.rollback.outputs.previous-revision }}
+    steps:
+      - name: Sign in to Azure (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Shift traffic to the requested revision
+        id: rollback
+        env:
+          RESOURCE_GROUP: ${{ inputs.resource-group }}
+          APP: ${{ inputs.container-app }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          TARGET: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
+          az extension add --name containerapp --upgrade --only-show-errors
+
+          revs=$(az containerapp revision list -n "$APP" -g "$RESOURCE_GROUP" -o json)
+
+          {
+            echo "### Container Apps revisions"
+            echo ""
+            echo "| Name | Created | Active | Traffic | Health |"
+            echo "|------|---------|--------|---------|--------|"
+            echo "$revs" | jq -r '.[] | "| \(.name) | \(.properties.createdTime // "") | \(.properties.active) | \(.properties.trafficWeight // 0) | \(.properties.healthState // "") |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          current=$(echo "$revs" | jq -r '[.[] | select(.properties.trafficWeight == 100)][0].name // empty')
+          if [ -z "$current" ]; then
+            echo "::error::no revision currently has 100 percent traffic"
+            exit 1
+          fi
+
+          if ! echo "$revs" | jq -e --arg t "$TARGET" 'any(.[]; .name == $t)' >/dev/null; then
+            echo "::error::revision $TARGET does not exist in this container app"
+            exit 1
+          fi
+
+          echo "revision=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "previous-revision=$current" >> "$GITHUB_OUTPUT"
+
+          if [ "$TARGET" = "$current" ]; then
+            echo "::notice::revision $TARGET already has 100 percent traffic; nothing to do"
+            echo "Already on $TARGET; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          active=$(echo "$revs" | jq -r --arg t "$TARGET" '.[] | select(.name == $t) | .properties.active')
+          if [ "$active" != "true" ]; then
+            az containerapp revision activate -n "$APP" -g "$RESOURCE_GROUP" --revision "$TARGET" -o none
+            ok=""
+            for _ in $(seq 1 36); do
+              state=$(az containerapp revision show -n "$APP" -g "$RESOURCE_GROUP" --revision "$TARGET" -o json)
+              health=$(echo "$state" | jq -r '.properties.healthState // empty' | tr '[:upper:]' '[:lower:]')
+              running=$(echo "$state" | jq -r '.properties.runningState // empty' | tr '[:upper:]' '[:lower:]')
+              if [ "$health" = "healthy" ] || [ "$running" = "healthy" ] || [ "$running" = "running" ] || [ "$running" = "runningatmaxscale" ]; then
+                ok=1
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::revision $TARGET did not become healthy within 3 minutes"
+              exit 1
+            fi
+          fi
+
+          public=$(az containerapp show -n "$APP" -g "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          if [ -z "$public" ] || [ "$public" = "None" ]; then
+            echo "::error::could not determine the public URL of $APP; traffic left on $current"
+            exit 1
+          fi
+
+          az containerapp ingress traffic set -n "$APP" -g "$RESOURCE_GROUP" --revision-weight "$TARGET=100" -o none
+
+          ok=""
+          for _ in $(seq 1 10); do
+            if curl -fsS --max-time 5 "https://$public$HEALTH_PATH" >/dev/null; then ok=1; break; fi
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            az containerapp ingress traffic set -n "$APP" -g "$RESOURCE_GROUP" --revision-weight "$current=100" -o none
+            echo "Public health check failed; traffic set back to $current." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::public health check failed; rolled traffic back to $current"
+            exit 1
+          fi
+
+          {
+            echo "Rolled back from $current to $TARGET"
+            echo "The bad code is still on main; fix forward or revert the commit."
+          } >> "$GITHUB_STEP_SUMMARY"
