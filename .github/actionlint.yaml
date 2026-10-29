@@ -1,0 +1,4 @@
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      - 'property "workflow_(sha|repository)" is not defined.*'
